@@ -1,0 +1,588 @@
+/**
+ \file 		innerproduct_test.cpp
+ \author	sreeram.sadasivam@cased.de
+ \copyright	ABY - A Framework for Efficient Mixed-protocol Secure Two-party Computation
+			Copyright (C) 2019 Engineering Cryptographic Protocols Group, TU Darmstadt
+			This program is free software: you can redistribute it and/or modify
+            it under the terms of the GNU Lesser General Public License as published
+            by the Free Software Foundation, either version 3 of the License, or
+            (at your option) any later version.
+            ABY is distributed in the hope that it will be useful,
+            but WITHOUT ANY WARRANTY; without even the implied warranty of
+            MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+            GNU Lesser General Public License for more details.
+            You should have received a copy of the GNU Lesser General Public License
+            along with this program. If not, see <http://www.gnu.org/licenses/>.
+ \brief		Inner Product Test class implementation.
+ */
+
+//Utility libs
+#include <ENCRYPTO_utils/crypto/crypto.h>
+#include <ENCRYPTO_utils/parse_options.h>
+//ABY Party class
+#include "abycore/aby/abyparty.h"
+
+#include "abycore/circuit/booleancircuits.h"
+#include "abycore/circuit/arithmeticcircuits.h"
+#include "abycore/circuit/circuit.h"
+#include "abycore/sharing/sharing.h"
+#include "common/mpc_util.h"
+
+#include <algorithm>
+#include <random>
+#include <filesystem>
+#include <iterator>
+
+#include "ttruth/ttruth.h"
+#include "mpc_ttruth/mpc_ttruth.h"
+#include <math.h>
+
+const int QUESTION_NUM = 1;// 87;
+const int USER_NUM = 1;
+
+int32_t read_test_options(int32_t *argcp, char ***argvp, e_role *role,
+                          uint32_t *bitlen, uint32_t *numbers, uint32_t *secparam, std::string *address,
+                          uint16_t *port, int32_t *test_op) {
+
+    uint32_t int_role = 0, int_port = 0;
+
+    parsing_ctx options[] =
+            {{(void *) &int_role, T_NUM, "r", "Role: 0/1",                                          true,  false},
+             {(void *) numbers,   T_NUM, "n", "Number of elements for inner product, default: 128", false, false},
+             {(void *) bitlen,    T_NUM, "b", "Bit-length, default 16",                             false, false},
+             {(void *) secparam,  T_NUM, "s", "Symmetric Security Bits, default: 128",              false, false},
+             {(void *) address,   T_STR, "a", "IP-address, default: localhost",                     false, false},
+             {(void *) &int_port, T_NUM, "p", "Port, default: 7766",                                false, false},
+             {(void *) test_op,   T_NUM, "t", "Single test (leave out for all operations), default: off",
+                                                                                                    false, false}};
+
+    if (!parse_options(argcp, argvp, options,
+                       sizeof(options) / sizeof(parsing_ctx))) {
+        print_usage(*argvp[0], options, sizeof(options) / sizeof(parsing_ctx));
+        std::cout << "Exiting" << std::endl;
+        exit(0);
+    }
+
+    assert(int_role < 2);
+    *role = (e_role) int_role;
+
+    if (int_port != 0) {
+        assert(int_port < 1 << (sizeof(uint16_t) * 8));
+        *port = (uint16_t) int_port;
+    }
+
+    return 1;
+}
+
+vector<string> string_split(const string &s) {
+    vector<string> tokens;
+    istringstream iss(s);
+    copy(istream_iterator<string>(iss), istream_iterator<string>(), back_inserter(tokens));
+    return tokens;
+}
+
+vector<vector<vector<string>>> load_keyword() {
+    const string kv_bath_dir = "../answer_grading/keywords";
+    vector<vector<vector<string>>> all_keywords(QUESTION_NUM);
+    // read answer
+    filesystem::directory_iterator end_itr;
+
+    for (filesystem::directory_iterator itr(kv_bath_dir); itr != end_itr; ++itr) {
+        // If it's not a directory, list it. If you want to list directories too, just remove this check.
+        if (filesystem::is_regular_file(itr->path())) {
+            // assign current file name to current_file and echo it out to the console.
+            auto current_file = itr->path();
+            int question_id = atof(current_file.filename().c_str());
+            if(question_id >= QUESTION_NUM) continue;
+            ifstream keywords_file(current_file.string());
+            vector<vector<string>> user_keywords;
+            if (!keywords_file.is_open()) {
+                cout<< "can not open answer file"<<endl;
+                cout << strerror(errno) << endl;
+                exit(0);
+            }
+            string raw_keywords;
+            int count = 0;
+            while (getline(keywords_file, raw_keywords)) {
+                auto keywords = string_split(raw_keywords);
+                user_keywords.push_back(std::move(keywords));
+                count+=1;
+                if(count>=USER_NUM) break;
+            }
+            all_keywords[question_id] = (std::move(user_keywords));
+        }
+    }
+
+    return all_keywords;
+}
+
+
+vector<vector<double>> load_score() {
+    const string score_bath_dir = "../answer_grading/scores";
+    vector<vector<double>> score(QUESTION_NUM);
+
+    filesystem::directory_iterator end_itr;
+    for (filesystem::directory_iterator itr(score_bath_dir); itr != end_itr; ++itr) {
+        if (filesystem::is_regular_file(itr->path())) {
+            auto current_file = itr->path();
+            int question_id = atof(current_file.filename().c_str());
+            if(question_id >= QUESTION_NUM) continue;
+            ifstream score_file(current_file.string());
+            vector<double> sub_scores;
+            if (!score_file.is_open()) {
+                cout << "can not open score file" << endl;
+                cout << strerror(errno) << endl;
+                exit(0);
+            }
+            double s;
+            int count = 0;
+            while (score_file >> s) {
+                sub_scores.push_back(s);
+                count+=1;
+                if(count>=USER_NUM) break;
+            }
+            score[question_id] = std::move(sub_scores);
+        }
+    }
+    return score;
+}
+
+unordered_map<string, vector<double>> load_pretrained_vec() {
+    const string model_path = "../answer_grading/pretrained_vec";
+    unordered_map<string, vector<double>> pretrained_vec;
+
+    ifstream word_embedding_file(model_path);
+    if (!word_embedding_file.is_open()) {
+        cout << "can not open word embedding file" << endl;
+        cout << strerror(errno) << endl;
+        exit(0);
+    }
+    string line;
+    while (getline(word_embedding_file, line)) {
+        istringstream iss(line);
+        string word;
+        iss >> word;
+        vector<double> vec;
+        double v;
+        while (iss >> v) {
+            vec.push_back(v);
+        }
+        pretrained_vec.emplace(word,vec);
+
+    }
+    word_embedding_file.close();
+//    cout<<pretrained_vec.size()<<endl;
+    return pretrained_vec;
+}
+
+void test_ttruth(int qn, int un) {
+    auto pretrained_vec = load_pretrained_vec();
+    auto all_keywords = load_keyword();
+    auto score = load_score();
+
+    if(score.size()!=all_keywords.size()) {
+        cout<<score.size()<<" "<<all_keywords.size()<<endl;
+        cout<<"wrong size at line"<<__LINE__<<" "<<__FILE__<<endl;
+        exit(-1);
+    }
+    int question_num = all_keywords.size();
+    int user_num = all_keywords[0].size();  // max 24
+
+//    vector<vector<vector<vector<double>>>> all_kvec(question_num,
+//                                                    vector<vector<vector<double>>>(user_num));
+//
+//    for(int i=0; i<question_num; i++) {
+//        for(int j=0; j<user_num; j++) {
+//            auto&keywords = all_keywords[i][j];
+//            vector<vector<double>> key_vecs;
+//            for (auto &w:keywords) {
+//                key_vecs.push_back(pretrained_vec.at(w));
+//            }
+//            all_kvec[i][j] = std::move(key_vecs);
+//        }
+//    }
+
+    vector<vector<vector<vector<double>>>> all_kvec(qn,
+                                                    vector<vector<vector<double>>>(un,
+                                                            vector<vector<double>>(10,
+                                                                    vector<double>(50, double(rand())/RAND_MAX))));
+
+//    for(int i=0; i<qn; i++) {
+//        for(int j=0; j<un; j++) {
+//            auto&keywords = all_keywords[i][j];
+//            vector<vector<double>> key_vecs;
+//            for (auto &w:keywords) {
+//                key_vecs.push_back(pretrained_vec.at(w));
+//            }
+//            all_kvec[i][j] = std::move(key_vecs);
+//        }
+//    }
+
+
+    auto s = std::chrono::high_resolution_clock::now();
+    int topK= 1;
+    auto topk_index = ttruth(all_kvec, topK);
+    auto e = std::chrono::high_resolution_clock::now();
+    auto d = std::chrono::duration_cast<std::chrono::microseconds>(e-s).count();
+    std::cout<< "qn: " << qn << " un:" << un <<" "<<d/1000.0/1000 <<"s"<<endl;
+
+    vector<double>total_avg(topK,0);
+    double all_socre = 0;
+    int all_count = question_num * topK;
+    for(int i=0;i<question_num;i++) {
+        vector<double>avg(topK,0);
+//        cout<<"question "<<i+1<<" ";
+        for(int j=0;j<topK;j++) {
+            int index = topk_index[i][j];
+//            cout<<score[i][index] << " ";
+            avg[j] += score[i][index];
+            if(j!=0) {
+                avg[j] += avg[j-1];
+            }
+            all_socre+=score[i][index];
+        }
+//        cout<<endl;
+        for(int j=0;j<topK;j++) {
+            avg[j] /= (j+1);
+            total_avg[j] += avg[j];
+        }
+    }
+    for(int i=0; i<topK;i++) {
+        total_avg[i]/=question_num;
+//        cout<< total_avg[i]<<" ";
+    }
+//    cout<<endl;
+//    cout<<"avg: " << all_socre/all_count;
+//    cout<<endl;
+    vector<double>total_avg2(topK,0);
+    for(int i=0;i<question_num;i++) {
+        vector<double>avg(topK,0);
+        for(int j=0;j<topK;j++) {
+            int index = topk_index[i][j];
+//            cout<<score[i][index] << " ";
+            total_avg2[j] += score[i][index];
+        }
+    }
+//    cout<<endl;
+    for(int i=0; i<topK;i++) {
+        total_avg2[i]/=question_num;
+//        cout<< total_avg2[i]<<" ";
+    }
+
+}
+
+void testMPCTextTruth(ABYParty *pt, e_role role) {
+    auto pretrained_vec = load_pretrained_vec();
+    auto all_keywords = load_keyword();
+    auto score = load_score();
+
+    if(score.size()!=all_keywords.size()) {
+        cout<<score.size()<<" "<<all_keywords.size()<<endl;
+        cout<<"wrong size at line"<<__LINE__<<" "<<__FILE__<<endl;
+        exit(-1);
+    }
+    int question_num = all_keywords.size();
+    int user_num = all_keywords[0].size();  // max 24
+
+    vector<vector<vector<vector<uint64_t>>>> all_kvec(question_num,
+                                                    vector<vector<vector<uint64_t>>>(user_num));
+
+    // convert keywords vector to sharing vector
+    for(int i=0; i<question_num; i++) {
+        for(int j=0; j<user_num; j++) {
+            auto&keywords = all_keywords[i][j];
+            vector<vector<uint64_t>> key_vecs;
+            for (auto &w:keywords) {
+                vector<double>tmp(pretrained_vec.at(w));
+                vector<uint64_t>vec(tmp.size(),0);
+                for(int k=0; k<tmp.size(); k++) {
+                    double t = tmp[k] * (1<<FLOAT_SCALE_FACTOR);
+                    if (t<0) {
+                        vec[k] = -uint64_t(-t);
+                    } else {
+                        vec[k] = t;
+                    }
+                    auto s = MPC::Share(vec[k], role);
+                    vec[k] = s.val();
+                }
+                key_vecs.push_back(std::move(vec));
+            }
+            all_kvec[i][j] = std::move(key_vecs);
+        }
+    }
+
+    vector<vector<vector<uint64_t>>> answers(question_num,
+                                             vector<vector<uint64_t>>(user_num,
+                                                     vector<uint64_t>(150,0)));
+
+    int topK=USER_NUM;
+    auto topk_index = MPC::ttruth(all_kvec, answers, topK, pt, role);
+    vector<double>total_avg(topK,0);
+    double all_socre = 0;
+    int all_count = question_num * topK;
+    for(int i=0;i<question_num;i++) {
+        vector<double>avg(topK,0);
+//        cout<<"question "<<i+1<<"th score ";
+        for(int j=0;j<topK;j++) {
+            int index = topk_index[i][j];
+            cout<<score[i][index] << " ";
+            avg[j] += score[i][index];
+            if(j!=0) {
+                avg[j] += avg[j-1];
+            }
+            all_socre+=score[i][index];
+        }
+        cout<<endl;
+        for(int j=0;j<topK;j++) {
+            avg[j] /= (j+1);
+            total_avg[j] += avg[j];
+        }
+    }
+//    cout<<"topK avg score: ";
+    for(int i=0; i<topK;i++) {
+        total_avg[i]/=question_num;
+        cout<< total_avg[i]<<" ";
+    }
+    cout<<endl;
+    cout<<"total topk avg score: " << all_socre/all_count;
+    cout<<endl;
+    vector<double>total_avg2(topK,0);
+    for(int i=0;i<question_num;i++) {
+        vector<double>avg(topK,0);
+        for(int j=0;j<topK;j++) {
+            int index = topk_index[i][j];
+//            cout<<score[i][index] << " ";
+            total_avg2[j] += score[i][index];
+        }
+    }
+//    cout<<endl;
+    cout<<"total avg score: ";
+    for(int i=0; i<topK;i++) {
+        total_avg2[i]/=question_num;
+//        cout<< total_avg2[i]<<" ";
+    }
+    cout<<endl;
+}
+
+void numerical_truth_discovery(int qn, int un) {
+    int dim = 50;
+    vector<vector<vector<float>>> data(qn, vector<vector<float>>(un, vector<float>(dim)));
+    // generate random number
+    for(int i=0; i<qn; i++) {
+        for(int j=0; j<un;j++) {
+            for(int k=0;k<dim;k++) {
+                data[i][j][k] = 3 + float(rand())/RAND_MAX;
+            }
+        }
+    }
+
+
+    auto s = std::chrono::high_resolution_clock::now();
+
+    // truth discovery
+    // init weight
+    vector<float>weight(un, 1);
+    vector<vector<float>> truth(qn, vector<float>(dim));
+
+    // iteration
+    int T = 10; // iteration round
+    for(int t=0; t<T; t++) {
+        // calculate ground truth
+        float total_weight = 0;
+        for(int k=0; k<un; k++) {
+            total_weight += weight[k];
+        }
+
+        for(int i=0; i<qn; i++) {
+            for(int j=0; j<dim; j++) {
+                for (int k = 0; k < un; k++) {
+                    truth[i][j] += weight[k] * data[i][k][j];
+                }
+                truth[i][j] /= total_weight;
+            }
+        }
+
+        // update weight
+
+        // calculate standard deviation
+        vector<vector<float>>std(qn,vector<float>(dim));
+        for(int i=0; i<qn; i++) {
+            for(int j=0; j<dim; j++) {
+                float s = 0;
+                float mean = 0;
+                for (int k = 0; k < un; k++) {
+                    mean += data[i][k][j];
+                }
+                mean/= un;
+                for (int k=0; k<un; k++) {
+                    s += pow(data[i][k][j] - mean, 2);
+                }
+                s/= un;
+                s = sqrt(s);
+                if(s == 0)   s = 0.000001;  // tolerance
+                std[i][j] = s;
+            }
+        }
+
+        // distance
+        vector<float>dis(un, 0);
+        for(int i=0; i<un; i++) {
+            float d = 0;
+            for(int j=0; j<qn; j++) {
+                for(int k=0; k<dim; k++) {
+                    d+= pow(truth[j][k] - data[j][i][k], 2) / std[j][k];
+                }
+            }
+            dis[i] = d;
+        }
+
+        //weight
+        float total_dis = 0;
+        for(int i=0; i<un; i++) {
+            total_dis += dis[i];
+        }
+
+        for(int i=0; i<un; i++) {
+            weight[i] = dis[i] / total_dis;
+            if (weight[i] == 0) weight[i] = 0.0000001; // tolerance
+            weight[i] = -log(weight[i]);
+        }
+    }
+
+    auto e = std::chrono::high_resolution_clock::now();
+    auto d = std::chrono::duration_cast<std::chrono::microseconds>(e-s).count();
+    std::cout<< "qn: " << qn << " un:" << un <<" "<<d/1000.0/1000 <<"s"<<endl;
+}
+
+void categorical_truth_discovery(int qn, int un) {
+    int dim = 50;
+    vector<vector<vector<float>>> data(qn, vector<vector<float>>(un, vector<float>(dim)));
+    // generate random number
+    for(int i=0; i<qn; i++) {
+        for(int j=0; j<un;j++) {
+            for(int k=0;k<dim;k++) {
+                data[i][j][k] = rand()%2;
+            }
+        }
+    }
+
+    auto s = std::chrono::high_resolution_clock::now();
+
+    // truth discovery
+    // init weight
+    vector<float>weight(un, 1);
+    vector<vector<float>> truth(qn, vector<float>(dim));
+
+    // iteration
+    int T = 10; // iteration round
+    for(int t=0; t<T; t++) {
+        // calculate ground truth
+        float total_weight = 0;
+        for(int k=0; k<un; k++) {
+            total_weight += weight[k];
+        }
+
+        for(int i=0; i<qn; i++) {
+            for(int j=0; j<dim; j++) {
+                float w0 = 0;
+                float w1 = 0;
+                for (int k = 0; k < un; k++) {
+                    w0 += weight[k] * (data[i][k][j] == 0);
+                    w1 += weight[k] * (data[i][k][j] == 1);
+                }
+                truth[i][j] = w0 > w1 ? 0 : 1;
+            }
+        }
+
+        // update weight
+
+        // distance
+        vector<float>dis(un, 0);
+        for(int i=0; i<un; i++) {
+            float d = 0;
+            for(int j=0; j<qn; j++) {
+                for(int k=0; k<dim; k++) {
+                    d+= (truth[j][k] != data[j][i][k]);
+                }
+            }
+            dis[i] = d;
+        }
+
+        //weight
+        float total_dis = 0;
+        for(int i=0; i<un; i++) {
+            total_dis += dis[i];
+        }
+
+        for(int i=0; i<un; i++) {
+            weight[i] = dis[i] / total_dis;
+            if (weight[i] == 0) weight[i] = 0.0000001; // tolerance
+            weight[i] = -log(weight[i]);
+        }
+    }
+
+    auto e = std::chrono::high_resolution_clock::now();
+    auto d = std::chrono::duration_cast<std::chrono::microseconds>(e-s).count();
+    std::cout<< "qn: " << qn << " un:" << un <<" "<<d/1000.0/1000 <<"s"<<endl;
+}
+
+int main(int argc, char **argv) {
+
+    e_role role;
+    uint32_t bitlen = UINT64_LEN, numbers = 128, secparam = 80, nthreads = 1;
+    uint16_t port = 7766;
+    std::string address = "127.0.0.1";
+    int32_t test_op = -1;
+    e_mt_gen_alg mt_alg = MT_OT;
+
+    read_test_options(&argc, &argv, &role, &bitlen, &numbers, &secparam, &address, &port, &test_op);
+
+    seclvl seclvl = get_sec_lvl(secparam);
+
+    // call inner product routine. set size with cmd-parameter -n <size>
+    ABYParty *pt = MPC::init_party(role, address, port, seclvl, UINT64_LEN, nthreads, mt_alg);
+
+    uint64_t  a = 10;
+    auto sharings = pt->GetSharings();
+    auto acirc = (ArithmeticCircuit*) sharings[S_ARITH]->GetCircuitBuildRoutine();
+    auto ycirc = (BooleanCircuit*) sharings[S_YAO]->GetCircuitBuildRoutine();
+    auto bcirc = (BooleanCircuit*) sharings[S_BOOL]->GetCircuitBuildRoutine();
+
+//    pt->ExecCircuit();
+//    pt->Reset();
+//    auto start = clock();
+//    auto s1 = acirc->PutSharedINGate(a, UINT64_LEN);
+//    auto s2 = bcirc->PutA2BGate(s1,ycirc);
+//    auto s3 = acirc->PutB2AGate(s2);
+//    auto s4 = acirc->PutSharedOUTGate(s3);
+//    pt->ExecCircuit();
+//    pt->Reset();
+//    auto end = clock();
+//    cout<<"time "<<double(end-start)/CLOCKS_PER_SEC<<endl;
+//    exit(-1);
+//    int qn = 50;
+    // test qn
+    for(int qn=1; qn<=100000; qn*=10) {
+        int un = 100;
+//        auto s = std::chrono::high_resolution_clock::now();
+//        test_ttruth(qn, un);
+//        numerical_truth_discovery(qn, un);
+    categorical_truth_discovery(qn, un);
+//        auto e = std::chrono::high_resolution_clock::now();
+//        auto d = std::chrono::duration_cast<std::chrono::microseconds>(e-s).count();
+//        std::cout<< "qn: " << qn << " un:" << un <<" "<<d/1000.0/1000 <<"s"<<endl;
+    }
+
+    //test un
+    for(int un=1; un<=100000; un*=10) {
+        int qn = 100;
+//        test_ttruth(qn, un);
+//        numerical_truth_discovery(qn, un);
+        categorical_truth_discovery(qn, un);
+    }
+
+//testMPCTextTruth(pt,role);
+    delete pt;
+    return 0;
+}
+
